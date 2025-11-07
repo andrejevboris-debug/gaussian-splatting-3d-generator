@@ -23,17 +23,28 @@ All empty directories contain `.gitkeep` files so that the structure persists in
    - Install Python requirements with `pip install -r requirements.txt` (update as needed).
 2. **Prepare inputs**
    - Copy your scene images into `data/input_images`.
-3. **Run Structure-from-Motion**
-   - Adapt and execute `scripts/run_colmap.sh` to generate sparse/dense reconstructions in `colmap`.
-4. **Configure training**
+3. **Extract frames (if starting from video)**
+   - `python run.py video-to-frames --video path/to/capture.mp4 --output data/input_images`
+4. **Run Structure-from-Motion**
+   - `python run.py colmap --images data/input_images`
+5. **Configure training**
    - Edit `training/configs/default.yaml` to match your scene and hardware.
-5. **Train Gaussian Splatting**
-   - Run `python scripts/train_3dgs.py --config training/configs/default.yaml`.
-6. **Export models**
+6. **Train Gaussian Splatting**
+   - `python run.py train --config training/configs/default.yaml --max-steps 1000`
+7. **Export models**
    - The trained Gaussian point cloud will be written to `outputs/3dgs_models`.
+
+## Pipeline CLI
+
+- `python run.py video-to-frames …` – convert a captured video into a frame directory using ffmpeg.
+- `python run.py colmap …` – run SfM + MVS via COLMAP and store outputs in `colmap/`.
+- `python run.py train …` – launch the (stub) Gaussian Splatting trainer with the chosen config.
+- `python run.py all …` – end-to-end pipeline: extract frames, run COLMAP, then train.
+
+See `python run.py --help` or each sub-command’s `--help` flag for the complete set of options.
 
 ## Next Steps
 
-- Flesh out `scripts/run_colmap.sh` with COLMAP commands suited to your capture rig.
-- Implement the training loop inside `scripts/train_3dgs.py`, integrating your preferred 3DGS library.
+- Tune `scripts/run_colmap.py` with matcher/mapper parameters suited to your capture hardware.
+- Replace the stubbed logic inside `scripts/train_3dgs.py` with a real Gaussian Splatting trainer.
 - Extend `training/configs/default.yaml` with scene-specific hyperparameters and optimizer settings.
