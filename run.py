@@ -129,6 +129,26 @@ def create_parser() -> argparse.ArgumentParser:
         default="INFO",
         help="Logging verbosity for the training script.",
     )
+    train_parser.add_argument(
+        "--backend",
+        type=str,
+        choices=("auto", "nerfstudio", "gsplat"),
+        default="auto",
+        help="Training backend to use.",
+    )
+    train_parser.add_argument(
+        "--backend-cmd",
+        type=str,
+        default=None,
+        help="Executable path for the training backend.",
+    )
+    train_parser.add_argument(
+        "--backend-arg",
+        action="append",
+        dest="backend_args",
+        default=[],
+        help="Additional backend argument (repeatable).",
+    )
 
     # all command
     all_parser = subparsers.add_parser("all", help="Run the complete pipeline end-to-end.")
@@ -153,6 +173,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Take every Nth frame instead of specifying fps.",
     )
     all_parser.add_argument(
+        "--image-format",
+        type=str,
+        default="png",
+        help="Image file extension for extracted frames.",
+    )
+    all_parser.add_argument("--start-time", type=float, default=None, help="Start time in seconds.")
+    all_parser.add_argument("--end-time", type=float, default=None, help="End time in seconds.")
+    all_parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite intermediate artifacts (frames + database).",
@@ -163,12 +191,50 @@ def create_parser() -> argparse.ArgumentParser:
         help="Skip COLMAP dense stereo and fusion.",
     )
     all_parser.add_argument(
+        "--matcher",
+        choices=("exhaustive", "sequential"),
+        default="exhaustive",
+        help="Feature matcher type for COLMAP.",
+    )
+    all_parser.add_argument(
+        "--colmap-cmd",
+        type=str,
+        default="colmap",
+        help="Path to the COLMAP executable.",
+    )
+    all_parser.add_argument(
         "--max-steps",
         type=int,
         default=None,
         help="Override training steps.",
     )
     all_parser.add_argument("--dry-run", action="store_true", help="Print commands without executing.")
+    all_parser.add_argument(
+        "--backend",
+        type=str,
+        choices=("auto", "nerfstudio", "gsplat"),
+        default="auto",
+        help="Training backend to use.",
+    )
+    all_parser.add_argument(
+        "--backend-cmd",
+        type=str,
+        default=None,
+        help="Executable path for the training backend.",
+    )
+    all_parser.add_argument(
+        "--backend-arg",
+        action="append",
+        dest="backend_args",
+        default=[],
+        help="Additional backend argument (repeatable).",
+    )
+    all_parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Logging verbosity for the training script.",
+    )
 
     return parser
 
@@ -211,18 +277,28 @@ def run_colmap_command(args: argparse.Namespace) -> None:
         print(f"[pipeline] COLMAP outputs available in {args.sparse} and {args.dense}")
 
 
-def run_train_command(args: argparse.Namespace) -> None:
-    train_args: List[str] = [
-        "--config",
-        str(args.config),
-    ]
-    if args.max_steps is not None:
+def build_train_args(args: argparse.Namespace) -> List[str]:
+    train_args: List[str] = ["--config", str(args.config)]
+    if getattr(args, "max_steps", None) is not None:
         train_args += ["--max-steps", str(args.max_steps)]
-    if args.dry_run:
+    if getattr(args, "dry_run", False):
         train_args.append("--dry-run")
-    if args.log_level:
-        train_args += ["--log-level", args.log_level]
-    train_main(train_args)
+    log_level = getattr(args, "log_level", None)
+    if log_level:
+        train_args += ["--log-level", log_level]
+    backend = getattr(args, "backend", None)
+    if backend:
+        train_args += ["--backend", backend]
+    backend_cmd = getattr(args, "backend_cmd", None)
+    if backend_cmd:
+        train_args += ["--backend-cmd", backend_cmd]
+    for extra in getattr(args, "backend_args", []) or []:
+        train_args += ["--backend-arg", extra]
+    return train_args
+
+
+def run_train_command(args: argparse.Namespace) -> None:
+    train_main(build_train_args(args))
     print("[pipeline] Training routine completed.")
 
 
@@ -233,7 +309,10 @@ def run_all_command(args: argparse.Namespace) -> None:
         output_dir=args.frames_dir,
         fps=args.fps,
         frame_step=args.frame_step,
+        image_format=args.image_format,
         overwrite=args.overwrite,
+        start_time=args.start_time,
+        end_time=args.end_time,
         dry_run=args.dry_run,
     )
     frame_paths = list(extract_frames(extract_settings))
@@ -248,6 +327,8 @@ def run_all_command(args: argparse.Namespace) -> None:
         database_path=DEFAULT_DATABASE,
         sparse_dir=DEFAULT_SPARSE,
         dense_dir=DEFAULT_DENSE,
+        colmap_cmd=args.colmap_cmd,
+        matcher=args.matcher,
         overwrite=args.overwrite,
         run_mvs=not args.skip_mvs,
         dry_run=args.dry_run,
@@ -259,12 +340,7 @@ def run_all_command(args: argparse.Namespace) -> None:
         print(f"[pipeline] COLMAP outputs ready at {DEFAULT_SPARSE} (sparse) and {DEFAULT_DENSE} (dense).")
 
     # 3. Train 3DGS
-    train_args: List[str] = ["--config", str(args.config)]
-    if args.max_steps is not None:
-        train_args += ["--max-steps", str(args.max_steps)]
-    if args.dry_run:
-        train_args.append("--dry-run")
-    train_main(train_args)
+    train_main(build_train_args(args))
     print("[pipeline] Training routine completed.")
 
 

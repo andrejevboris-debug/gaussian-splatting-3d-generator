@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-Extract frames from a video file using ffmpeg.
+Extract frames from a video file using ffmpeg-python.
 
-This script provides both a callable function (`extract_frames`) and a CLI entry
-point. It wraps ffmpeg in a small amount of ergonomics so callers can easily
-convert a captured video into a folder of images ready for COLMAP.
+This module exposes a high-level `extract_frames` function alongside a CLI entry
+point so it can be reused programmatically (e.g. from `run.py`) or invoked
+directly. It supports sampling by FPS or frame step, partial extraction, and dry
+run previews. The output naming scheme matches COLMAP expectations.
 """
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
+
+try:
+    import ffmpeg  # type: ignore
+except ImportError as exc:  # pragma: no cover - guidance for first-time users
+    raise SystemExit(
+        "The `ffmpeg-python` package is required. Install it with `pip install ffmpeg-python`."
+    ) from exc
+
+
+log = logging.getLogger(__name__)
 
 
 class FrameExtractionError(RuntimeError):
@@ -43,64 +53,65 @@ class ExtractionSettings:
             raise ValueError("Frame step must be greater than zero.")
         if not self.image_format:
             raise ValueError("Image format cannot be empty.")
+        if self.end_time is not None and self.start_time is not None:
+            if self.end_time <= self.start_time:
+                raise ValueError("--end-time must be greater than --start-time.")
 
 
-def build_ffmpeg_command(settings: ExtractionSettings, output_pattern: Path) -> List[str]:
-    command: List[str] = [
-        "ffmpeg",
-        "-y" if settings.overwrite else "-n",
-        "-loglevel",
-        "error",
-    ]
-
+def _build_ffmpeg_stream(settings: ExtractionSettings, output_pattern: Path) -> ffmpeg.nodes.OutputStream:
+    input_kwargs = {}
     if settings.start_time is not None:
-        command.extend(["-ss", str(settings.start_time)])
-    command.extend(["-i", str(settings.video_path)])
-    if settings.end_time is not None:
-        command.extend(["-to", str(settings.end_time)])
+        input_kwargs["ss"] = settings.start_time
 
-    filters: List[str] = []
+    stream = ffmpeg.input(str(settings.video_path), **input_kwargs)
+
     if settings.fps is not None:
-        filters.append(f"fps={settings.fps}")
+        stream = stream.filter("fps", fps=settings.fps)
     elif settings.frame_step is not None:
-        filters.append(f"select=not(mod(n\\,{settings.frame_step}))")
-        filters.append("setpts=N/TB")
+        stream = stream.filter("select", f"not(mod(n\\,{settings.frame_step}))")
+        stream = stream.filter("setpts", "N/TB")
 
-    if filters:
-        command.extend(["-vf", ",".join(filters)])
+    output_kwargs = {"vsync": "vfr"}
+    if settings.end_time is not None:
+        if settings.start_time is not None:
+            duration = settings.end_time - settings.start_time
+            output_kwargs["t"] = duration
+        else:
+            output_kwargs["to"] = settings.end_time
 
-    command.extend(["-vsync", "vfr", str(output_pattern)])
-    return command
+    return ffmpeg.output(stream, str(output_pattern), **output_kwargs)
 
 
 def extract_frames(settings: ExtractionSettings) -> Iterable[Path]:
     """
-    Extract frames and return a generator over the produced image paths.
+    Extract frames and return an iterable of produced image paths.
     """
     settings.validate()
-
-    if shutil.which("ffmpeg") is None:
-        raise FrameExtractionError("ffmpeg executable not found in PATH.")
-
     settings.output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_pattern = settings.output_dir / f"frame_%06d.{settings.image_format}"
+    extension = settings.image_format.lstrip(".")
+    output_pattern = settings.output_dir / f"frame_%06d.{extension}"
 
-    command = build_ffmpeg_command(settings, output_pattern)
+    stream = _build_ffmpeg_stream(settings, output_pattern)
+    command: List[str] = ffmpeg.compile(stream, overwrite_output=settings.overwrite)
+
     if settings.dry_run:
         print("[extract-frames] Dry run:", " ".join(command))
-        return sorted(settings.output_dir.glob(f"*.{settings.image_format}"))
+        return sorted(settings.output_dir.glob(f"*.{extension}"))
 
     try:
-        subprocess.run(command, check=True)
-    except subprocess.CalledProcessError as exc:
-        raise FrameExtractionError("ffmpeg failed to extract frames.") from exc
+        ffmpeg.run(stream, overwrite_output=settings.overwrite, capture_stdout=True, capture_stderr=True)
+    except ffmpeg.Error as exc:
+        stderr = exc.stderr.decode("utf-8", errors="ignore") if getattr(exc, "stderr", None) else ""
+        raise FrameExtractionError(f"ffmpeg failed to extract frames: {stderr}") from exc
 
-    return sorted(settings.output_dir.glob(f"*.{settings.image_format}"))
+    produced = sorted(settings.output_dir.glob(f"*.{extension}"))
+    log.debug("Extracted %d frames into %s", len(produced), settings.output_dir)
+    return produced
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract frames from a video using ffmpeg.")
+    parser = argparse.ArgumentParser(description="Extract frames from a video using ffmpeg-python.")
     parser.add_argument("--video", required=True, type=Path, help="Path to the input video file.")
     parser.add_argument(
         "--output",
@@ -152,6 +163,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     args = parse_args(argv)
     settings = ExtractionSettings(
         video_path=args.video,
@@ -167,9 +179,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     frame_paths = list(extract_frames(settings))
     if args.dry_run:
-        print(
-            f"[extract-frames] Dry run complete. Existing frames counted: {len(frame_paths)}"
-        )
+        print(f"[extract-frames] Dry run complete. Existing frames counted: {len(frame_paths)}")
     else:
         print(f"[extract-frames] Extracted {len(frame_paths)} frames into {settings.output_dir}")
 

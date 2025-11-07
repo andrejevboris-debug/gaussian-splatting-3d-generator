@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
 """
-Stubbed Gaussian Splatting training loop.
+Launch Gaussian Splatting training via gsplat or Nerfstudio.
 
-The script loads a YAML configuration, validates required inputs (COLMAP outputs,
-logging/checkpoint directories), and runs a lightweight simulated training loop.
-It is intentionally structured so that the stub can be replaced with a real 3DGS
-implementation without changing the CLI surface.
+This script translates project configuration files into concrete training
+commands for either backend. It validates COLMAP outputs, prepares logging and
+checkpoint directories, and finally shells out to the requested training CLI.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import logging
-import math
-import random
-import time
-from dataclasses import dataclass, field
-from datetime import datetime
+import shutil
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     import yaml  # type: ignore
-except ImportError as exc:  # pragma: no cover - guidance for first use
-    raise SystemExit(
-        "PyYAML is required to parse configuration files. Install with `pip install pyyaml`."
-    ) from exc
+except ImportError as exc:  # pragma: no cover - first run guidance
+    raise SystemExit("PyYAML is required. Install with `pip install pyyaml`.") from exc
+
+
+log = logging.getLogger(__name__)
 
 
 class TrainingError(RuntimeError):
@@ -86,149 +84,163 @@ def prepare_training_paths(config: Dict[str, Any], config_path: Path) -> Trainin
     )
 
 
-def configure_logging(log_dir: Path, log_level: str) -> logging.Logger:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    log_path = log_dir / f"training_{timestamp}.log"
-
-    logger = logging.getLogger("gaussian_splatting")
-    logger.setLevel(getattr(logging, log_level.upper()))
-    logger.handlers.clear()
-
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    logger.debug("Logging initialised. Writing to %s", log_path)
-    return logger
-
-
 @dataclass
-class TrainingState:
-    step: int = 0
-    loss: float = math.inf
-    lr: float = 0.0
-    history: list = field(default_factory=list)
+class TrainingSettings:
+    config_path: Path
+    max_steps: Optional[int]
+    dry_run: bool
+    log_level: str
+    backend: str
+    backend_cmd: Optional[str]
+    extra_args: List[str]
 
 
-class GaussianSplattingTrainer:
-    def __init__(
-        self,
-        config: Dict[str, Any],
-        paths: TrainingPaths,
-        logger: logging.Logger,
-        dry_run: bool = False,
-        max_steps: Optional[int] = None,
-    ) -> None:
-        self.config = config
-        self.paths = paths
-        self.logger = logger
-        self.dry_run = dry_run
-        self.max_steps = max_steps
-        self.state = TrainingState()
-        self._rng = random.Random(config["training"].get("seed", 42))
-
-    def validate_inputs(self) -> None:
-        if not self.paths.scene_image_dir.exists():
-            raise TrainingError(f"Input image directory does not exist: {self.paths.scene_image_dir}")
-        if not self.paths.sparse_dir.exists():
-            raise TrainingError(f"Sparse COLMAP outputs not found: {self.paths.sparse_dir}")
-        if not self.paths.dense_dir.exists():
-            self.logger.warning(
-                "Dense COLMAP outputs not found at %s. Proceeding without dense supervision.",
-                self.paths.dense_dir,
-            )
-
-        self.paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.paths.model_dir.mkdir(parents=True, exist_ok=True)
-
-    def train(self) -> None:
-        self.validate_inputs()
-
-        total_steps = int(self.config["training"]["steps"])
-        if self.max_steps is not None:
-            total_steps = min(total_steps, self.max_steps)
-            self.logger.info("Overriding steps to %d", total_steps)
-
-        batch_size = int(self.config["training"].get("batch_size", 1))
-        base_lr = float(self.config["training"].get("learning_rate", 0.005))
-        warmup_steps = int(self.config["training"].get("warmup_steps", 0))
-
-        if self.dry_run:
-            self.logger.info("Dry run enabled. Configuration validated; skipping training loop.")
-            return
-
-        self.logger.info("Starting training for %d steps (batch_size=%d)", total_steps, batch_size)
-        start_time = time.perf_counter()
-
-        log_interval = int(self.config.get("logging", {}).get("log_interval", 100))
-        ckpt_interval = int(self.config.get("logging", {}).get("checkpoint_interval", 1000))
-
-        for step in range(1, total_steps + 1):
-            lr_scale = 1.0 if step > warmup_steps else max(step / max(1, warmup_steps), 0.1)
-            lr = base_lr * lr_scale
-            simulated_loss = self._simulate_loss(step, lr)
-
-            self.state.step = step
-            self.state.loss = simulated_loss
-            self.state.lr = lr
-
-            if step % log_interval == 0 or step == 1 or step == total_steps:
-                self._log_metrics(step, simulated_loss, lr)
-
-            if ckpt_interval and step % ckpt_interval == 0:
-                self._write_checkpoint(step, simulated_loss, lr)
-
-        duration = time.perf_counter() - start_time
-        self.logger.info("Training complete in %.2f seconds.", duration)
-        self._export_model()
-
-    def _simulate_loss(self, step: int, lr: float) -> float:
-        decay = math.exp(-step / max(1.0, self.config["training"]["steps"] / 4))
-        noise = self._rng.normalvariate(0, 0.02)
-        regularization = 0.1 * (1 - lr)
-        loss = max(decay + regularization + noise, 1e-5)
-        self.state.history.append({"step": step, "loss": loss, "lr": lr})
-        return loss
-
-    def _log_metrics(self, step: int, loss: float, lr: float) -> None:
-        self.logger.info("Step %d | loss=%.4f | lr=%.6f", step, loss, lr)
-
-    def _write_checkpoint(self, step: int, loss: float, lr: float) -> None:
-        checkpoint = {
-            "step": step,
-            "loss": loss,
-            "learning_rate": lr,
-            "config": self.config,
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-        checkpoint_path = self.paths.checkpoint_dir / f"checkpoint_step_{step:06d}.json"
-        with checkpoint_path.open("w", encoding="utf-8") as handle:
-            json.dump(checkpoint, handle, indent=2)
-        self.logger.info("Saved checkpoint to %s", checkpoint_path)
-
-    def _export_model(self) -> None:
-        model_metadata = {
-            "scene": self.config["scene"]["name"],
-            "config": self.config,
-            "final_step": self.state.step,
-            "final_loss": self.state.loss,
-            "created_at": datetime.utcnow().isoformat(),
-            "notes": "This is a placeholder export. Replace with actual gaussian parameters.",
-        }
-        model_path = self.paths.model_dir / f"{self.config['scene']['name']}_gaussians.json"
-        with model_path.open("w", encoding="utf-8") as handle:
-            json.dump(model_metadata, handle, indent=2)
-        self.logger.info("Exported stub Gaussian model to %s", model_path)
+def ensure_inputs(paths: TrainingPaths) -> None:
+    if not paths.scene_image_dir.exists():
+        raise TrainingError(f"Input image directory not found: {paths.scene_image_dir}")
+    if not paths.sparse_dir.exists():
+        raise TrainingError(f"Sparse COLMAP outputs not found: {paths.sparse_dir}")
+    if not paths.dense_dir.exists():
+        log.warning("Dense COLMAP outputs not found at %s. Continuing without dense supervision.", paths.dense_dir)
+    paths.log_dir.mkdir(parents=True, exist_ok=True)
+    paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    paths.model_dir.mkdir(parents=True, exist_ok=True)
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def discover_backend(settings: TrainingSettings) -> str:
+    if settings.backend != "auto":
+        return settings.backend
+
+    if settings.backend_cmd:
+        cmd = Path(settings.backend_cmd).name.lower()
+        if "ns-train" in cmd or "nerfstudio" in cmd:
+            return "nerfstudio"
+        if "gsplat" in cmd:
+            return "gsplat"
+
+    if shutil.which("gsplat"):
+        return "gsplat"
+    if shutil.which("ns-train"):
+        return "nerfstudio"
+
+    raise TrainingError(
+        "Could not automatically determine training backend. Install gsplat or Nerfstudio, "
+        "or specify --backend together with --backend-cmd."
+    )
+
+
+def _coerce_steps(config: Dict[str, Any], override: Optional[int]) -> Optional[int]:
+    try:
+        default_steps = int(config.get("training", {}).get("steps", 0))
+    except (TypeError, ValueError):
+        default_steps = 0
+    if override is not None:
+        return override
+    return default_steps or None
+
+
+def build_nerfstudio_command(
+    settings: TrainingSettings, paths: TrainingPaths, config: Dict[str, Any]
+) -> List[str]:
+    executable = settings.backend_cmd or "ns-train"
+    if shutil.which(executable) is None:
+        raise TrainingError(f"Nerfstudio executable not found: {executable}")
+
+    scene_name = config.get("scene", {}).get("name", paths.scene_image_dir.name)
+    steps = _coerce_steps(config, settings.max_steps)
+
+    command: List[str] = [
+        executable,
+        "splatfacto",
+        "--data",
+        str(paths.scene_image_dir),
+        "--load-colmap",
+        str(paths.sparse_dir),
+        "--output-dir",
+        str(paths.model_dir),
+        "--experiment-name",
+        scene_name,
+        "--viewer.quit-on-train-completion",
+        "True",
+    ]
+
+    if paths.dense_dir.exists():
+        command += ["--pipeline.datamanager.dataparser.include_mono_prior", "False"]
+
+    if steps is not None:
+        command += ["--max-num-iterations", str(steps)]
+
+    log_interval = config.get("logging", {}).get("log_interval")
+    if isinstance(log_interval, int) and log_interval > 0:
+        command += ["--logging.interval", str(log_interval)]
+
+    command.extend(settings.extra_args)
+    return command
+
+
+def build_gsplat_command(settings: TrainingSettings, paths: TrainingPaths, config: Dict[str, Any]) -> List[str]:
+    executable = settings.backend_cmd or "gsplat"
+    if shutil.which(executable) is None:
+        raise TrainingError(f"gsplat executable not found: {executable}")
+
+    steps = _coerce_steps(config, settings.max_steps)
+    scene_name = config.get("scene", {}).get("name", paths.scene_image_dir.name)
+
+    command: List[str] = [
+        executable,
+        "train",
+        "--config",
+        str(settings.config_path),
+        "--data",
+        str(paths.scene_image_dir),
+        "--colmap",
+        str(paths.sparse_dir),
+        "--dense",
+        str(paths.dense_dir),
+        "--output",
+        str(paths.model_dir),
+        "--scene-name",
+        scene_name,
+        "--checkpoint-dir",
+        str(paths.checkpoint_dir),
+    ]
+
+    if steps is not None:
+        command += ["--max-steps", str(steps)]
+
+    command.extend(settings.extra_args)
+    return command
+
+
+def run_training(settings: TrainingSettings) -> None:
+    config = load_config(settings.config_path)
+    paths = prepare_training_paths(config, settings.config_path)
+    ensure_inputs(paths)
+
+    backend = discover_backend(settings)
+    log.info("Using training backend: %s", backend)
+
+    if backend == "nerfstudio":
+        command = build_nerfstudio_command(settings, paths, config)
+    elif backend == "gsplat":
+        command = build_gsplat_command(settings, paths, config)
+    else:
+        raise TrainingError(f"Unsupported backend: {backend}")
+
+    log.info("[train] %s", " ".join(command))
+    print("[train]", " ".join(command))
+
+    if settings.dry_run:
+        log.info("Dry run enabled. Training command not executed.")
+        return
+
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise TrainingError(f"Training command failed: {' '.join(command)}") from exc
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a Gaussian Splatting model.")
     parser.add_argument(
         "--config",
@@ -240,12 +252,32 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--max-steps",
         type=int,
         default=None,
-        help="Override the number of training steps (useful for quick tests).",
+        help="Override the number of training steps.",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        choices=("auto", "nerfstudio", "gsplat"),
+        help="Training backend to use. Defaults to auto-detection.",
+    )
+    parser.add_argument(
+        "--backend-cmd",
+        type=str,
+        default=None,
+        help="Executable to invoke for the training backend (e.g. path to ns-train or gsplat).",
+    )
+    parser.add_argument(
+        "--backend-arg",
+        action="append",
+        dest="extra_args",
+        default=[],
+        help="Additional argument to forward to the backend. Can be specified multiple times.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate inputs without running the training loop.",
+        help="Validate inputs and show the command without executing it.",
     )
     parser.add_argument(
         "--log-level",
@@ -256,26 +288,25 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
+
     config_path = args.config.resolve()
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    config = load_config(config_path)
-    paths = prepare_training_paths(config, config_path)
-
-    logger = configure_logging(paths.log_dir, args.log_level)
-    logger.info("Loaded configuration from %s", config_path)
-
-    trainer = GaussianSplattingTrainer(
-        config=config,
-        paths=paths,
-        logger=logger,
-        dry_run=args.dry_run,
+    settings = TrainingSettings(
+        config_path=config_path,
         max_steps=args.max_steps,
+        dry_run=args.dry_run,
+        log_level=args.log_level,
+        backend=args.backend,
+        backend_cmd=args.backend_cmd,
+        extra_args=list(args.extra_args),
     )
-    trainer.train()
+
+    run_training(settings)
 
 
 if __name__ == "__main__":
