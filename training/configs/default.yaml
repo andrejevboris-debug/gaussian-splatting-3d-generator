@@ -1,0 +1,37 @@
+scene:
+  name: default_scene
+  image_dir: ../../data/input_images
+  colmap_sparse_dir: ../../colmap/sparse
+  colmap_dense_dir: ../../colmap/dense
+
+training:
+  seed: 42
+  steps: 30000
+  batch_size: 1
+  learning_rate: 0.005
+  warmup_steps: 500
+  ema_decay: 0.995
+
+model:
+  sh_degree: 3
+  position_lr_mult: 0.5
+  opacity_lr: 0.005
+  scaling_lr: 0.005
+  rotation_lr: 0.01
+
+optimization:
+  loss_weights:
+    photometric: 1.0
+    densification: 0.2
+  densify_from_step: 500
+  densify_interval: 500
+  max_gaussians: 300000
+
+logging:
+  log_interval: 100
+  checkpoint_interval: 1000
+  output_dir: ../../training/logs
+
+output:
+  model_dir: ../../outputs/3dgs_models
+  checkpoint_dir: ../../training/checkpoints
